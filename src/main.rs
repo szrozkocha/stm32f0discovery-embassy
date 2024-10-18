@@ -111,5 +111,3 @@ async fn set_led(led_type: LedType) {
     let led_ref = LED.lock().await;
     led_ref.replace(led_type);
 }
-
-//PC0 ADC_IN10
