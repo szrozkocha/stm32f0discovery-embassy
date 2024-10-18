@@ -6,7 +6,7 @@ use core::ops::{Deref};
 use core::sync::atomic::{AtomicU16, Ordering};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::adc::{Adc, AdcPin, SampleTime};
+use embassy_stm32::adc::{Adc, SampleTime};
 use embassy_stm32::{adc, bind_interrupts};
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
