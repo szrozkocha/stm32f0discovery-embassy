@@ -3,48 +3,81 @@
 
 use core::cell::RefCell;
 use core::ops::{Deref};
+use core::sync::atomic::{AtomicU16, Ordering};
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_stm32::adc::{Adc, AdcPin, SampleTime};
+use embassy_stm32::{adc, bind_interrupts};
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
-use embassy_sync::blocking_mutex::Mutex;
+use embassy_stm32::peripherals::{ADC, PC0};
+use embassy_sync::mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_time::Timer;
+use embassy_time::{Delay, Timer};
 //noinspection RsUnusedImport
 use {defmt_rtt as _, panic_probe as _};
 
-enum Led {
+bind_interrupts!(struct Irqs {
+    ADC1_COMP => adc::InterruptHandler<ADC>;
+});
+
+#[derive(Clone, Copy, Format)]
+enum LedType {
     Green,
     Blue
 }
 
-static LED: Mutex<ThreadModeRawMutex, RefCell<Led>> = Mutex::new(RefCell::new(Led::Green));
+impl LedType {
+    fn toggle(&mut self) {
+        match self {
+            LedType::Green => *self = LedType::Blue,
+            LedType::Blue => *self = LedType::Green,
+        }
+    }
+}
+
+static LED: Mutex<ThreadModeRawMutex, RefCell<LedType>> = Mutex::new(RefCell::new(LedType::Green));
+static IDLE_TIME: AtomicU16 = AtomicU16::new(0);
 
 #[embassy_executor::task]
-async fn led_task(green_pin: AnyPin, blue_pin: AnyPin) {
+async fn led_task(mut green_led: Output<'static, AnyPin>, mut blue_led: Output<'static, AnyPin>) {
     info!("Led Task");
 
-    let mut green_led = Output::new(green_pin, Level::High, Speed::Low);
-    let mut blue_led = Output::new(blue_pin, Level::Low, Speed::Low);
-
     loop {
-        LED.lock(|ref_cell| {
-            let borrowed = ref_cell.borrow();
-            let led = borrowed.deref();
+        {
+            let led_ref = LED.lock().await;
 
-            match led {
-                Led::Green => {
+            let led = led_ref.borrow();
+
+            match led.deref() {
+                LedType::Green => {
                     blue_led.set_low();
                     green_led.toggle()
                 }
-                Led::Blue => {
+                LedType::Blue => {
                     green_led.set_low();
                     blue_led.toggle()
                 }
             }
-        });
+        }
 
-        Timer::after_millis(300).await;
+        Timer::after_millis(IDLE_TIME.load(Ordering::Relaxed) as u64).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn potentiometer_task(mut potentiometer: PC0, adc: ADC) {
+    info!("Potentiometer Task");
+
+    let mut delay = Delay;
+    let mut converter = Adc::new(adc, Irqs, &mut delay);
+
+    converter.set_sample_time(SampleTime::Cycles71_5);
+
+    loop {
+        let value = converter.read(&mut potentiometer).await;
+        IDLE_TIME.store(value, Ordering::Relaxed);
+        Timer::after_millis(100).await;
     }
 }
 
@@ -53,26 +86,30 @@ async fn main(spawner: Spawner) {
 
     info!("Init");
     let peripherals = embassy_stm32::init(Default::default());
-    let button_input = Input::new(peripherals.PA0, Pull::None);
-    let mut button = ExtiInput::new(button_input, peripherals.EXTI0);
 
-    spawner.spawn(led_task(peripherals.PC9.degrade(), peripherals.PC8.degrade())).unwrap();
+    let green_led = Output::new(peripherals.PC9.degrade(), Level::High, Speed::Low);
+    let blue_led = Output::new(peripherals.PC8.degrade(), Level::Low, Speed::Low);
 
+    let mut button = ExtiInput::new(Input::new(peripherals.PA0, Pull::None), peripherals.EXTI0);
+
+    let adc: ADC = peripherals.ADC;
+
+    spawner.spawn(led_task(green_led, blue_led)).unwrap();
+    spawner.spawn(potentiometer_task(peripherals.PC0, adc)).unwrap();
+
+    let mut led_type = LedType::Green;
     loop {
         button.wait_for_rising_edge().await;
-        info!("Set green");
-        set_led(Led::Green).await;
-        button.wait_for_falling_edge().await;
-
-        button.wait_for_rising_edge().await;
-        info!("Set blue");
-        set_led(Led::Blue).await;
+        led_type.toggle();
+        info!("Set {}", led_type);
+        set_led(led_type).await;
         button.wait_for_falling_edge().await;
     }
 }
 
-async fn set_led(led: Led) {
-    LED.lock(|ref_cell| {
-        ref_cell.replace(led);
-    });
+async fn set_led(led_type: LedType) {
+    let led_ref = LED.lock().await;
+    led_ref.replace(led_type);
 }
+
+//PC0 ADC_IN10
